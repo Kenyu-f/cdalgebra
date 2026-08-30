@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cayley–Dickson 乗積表 — 3D可視化</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js" crossorigin="anonymous"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+  :root{
+    --bg:#0D0F14; --panel:#161922cc; --border:#2A2F3D; --text:#ECE9E0; --muted:#8A8F9E;
+    --fbody:"Inter","Hiragino Kaku Gothic ProN",sans-serif; --fmono:"IBM Plex Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:var(--fbody);overflow:hidden;}
+  #canvas-container{position:fixed;inset:0;}
+  #canvas-container canvas{display:block;cursor:grab;}
+  #canvas-container.dragging canvas{cursor:grabbing;}
+  #ui{position:fixed;top:16px;left:16px;z-index:10;background:var(--panel);backdrop-filter:blur(6px);
+    border:1px solid var(--border);border-radius:10px;padding:14px 16px;max-width:300px;}
+  #ui h1{font-size:14px;margin:0 0 10px;font-weight:600;}
+  .row{display:flex;align-items:center;gap:8px;margin-bottom:9px;flex-wrap:wrap;}
+  .row label{font-size:11.5px;color:var(--muted);min-width:78px;}
+  select,input[type=range]{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;
+    padding:5px 6px;font-family:var(--fmono);font-size:12.5px;}
+  input[type=range]{padding:0;width:110px;}
+  .pill{padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;border:1px solid var(--border);
+    background:transparent;color:var(--muted);}
+  .pill.active{border-color:#C9A227;background:rgba(201,162,39,.15);color:#C9A227;}
+  #hint{position:fixed;bottom:14px;left:16px;font-size:11.5px;color:var(--muted);z-index:10;font-family:var(--fbody);}
+  #stats{position:fixed;bottom:14px;right:16px;font-size:11px;color:var(--muted);font-family:var(--fmono);z-index:10;text-align:right;}
+</style>
+</head>
+<body>
+<div id="canvas-container"></div>
+<div id="ui">
+  <h1>Cayley–Dickson 乗積表 — 3D</h1>
+  <div class="row">
+    <label>次元 (n)</label>
+    <input id="nSlider" type="range" min="1" max="7" step="1" value="4" />
+    <span id="nLabel" style="font-family:var(--fmono);font-size:12.5px;">n=4 (dim16)</span>
+  </div>
+  <div class="row">
+    <label>高さの意味</label>
+    <select id="heightMode">
+      <option value="idx">結果の基底番号</option>
+      <option value="sign">符号のみ (±)</option>
+      <option value="dist">|i-j| (対角からの距離)</option>
+    </select>
+  </div>
+  <div class="row" style="gap:6px;">
+    <span class="pill active" data-preset="rainbow">虹色</span>
+    <span class="pill" data-preset="ocean">海</span>
+    <span class="pill" data-preset="fire">炎</span>
+    <span class="pill" data-preset="mono">モノクロ</span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="autoRotate" checked style="width:auto;"/> 自動回転</label>
+  </div>
+</div>
+<div id="hint">ドラッグで回転 ・ ホイールでズーム</div>
+<div id="stats"></div>
+
+<script>
+/* ============================================================
+   Fast combinatorial Cayley–Dickson basis multiplication
+   (same algorithm verified in the Rust/Node versions: the product
+   of two basis elements is always ± a single basis element, so we
+   track (index, sign) instead of full vectors — O(log dim) per cell)
+   ============================================================ */
+function mulBasis(dim, i, j){
+  if(dim===1) return [0,1];
+  const half = dim/2;
+  if(i<half && j<half){
+    return mulBasis(half,i,j);
+  } else if(i<half && j>=half){
+    const jj=j-half;
+    const [idx,s]=mulBasis(half,jj,i);
+    return [half+idx, s];
+  } else if(i>=half && j<half){
+    const ii=i-half;
+    const conjSign = (j===0)?1:-1;
+    const [idx,s]=mulBasis(half,ii,j);
+    return [half+idx, s*conjSign];
+  } else {
+    const ii=i-half, jj=j-half;
+    const conjSign = (jj===0)?1:-1;
+    const [idx,s]=mulBasis(half,jj,ii);
+    return [idx, -1*s*conjSign];
+  }
+}
+
+const PRESETS = {
+  rainbow: { hueStart:0,   hueEnd:300, sat:0.55, lightPos:0.55, lightNeg:0.30 },
+  ocean:   { hueStart:180, hueEnd:260, sat:0.65, lightPos:0.60, lightNeg:0.25 },
+  fire:    { hueStart:0,   hueEnd:50,  sat:0.80, lightPos:0.60, lightNeg:0.25 },
+  mono:    { hueStart:0,   hueEnd:0,   sat:0.0,  lightPos:0.72, lightNeg:0.22 },
+};
+let currentPreset = 'rainbow';
+let currentHeightMode = 'idx';
+let currentN = 4;
+
+/* ============================================================
+   THREE.JS SCENE
+   ============================================================ */
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0D0F14);
+scene.fog = new THREE.FogExp2(0x0D0F14, 0.012);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const ambient = new THREE.AmbientLight(0xffffff, 0.55);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+dirLight.position.set(30, 60, 20);
+scene.add(dirLight);
+const rimLight = new THREE.DirectionalLight(0x5fcfc4, 0.35);
+rimLight.position.set(-40, 10, -30);
+scene.add(rimLight);
+
+// baseplate for visual grounding
+const plateGeo = new THREE.PlaneGeometry(200, 200);
+const plateMat = new THREE.MeshStandardMaterial({ color: 0x11141c, roughness: 1, metalness: 0 });
+const plate = new THREE.Mesh(plateGeo, plateMat);
+plate.rotation.x = -Math.PI/2;
+plate.position.y = -0.01;
+scene.add(plate);
+
+const rig = new THREE.Group(); // rotates as a whole (drag / auto-rotate)
+scene.add(rig);
+
+let instancedMesh = null;
+const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+const dummy = new THREE.Object3D();
+const color = new THREE.Color();
+
+function buildTable(n){
+  currentN = n;
+  const dim = 1 << n;
+  document.getElementById('nLabel').textContent = `n=${n} (dim${dim})`;
+
+  if(instancedMesh){ rig.remove(instancedMesh); instancedMesh.geometry.dispose(); instancedMesh.material.dispose(); }
+
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.55, metalness: 0.08 });
+  const mesh = new THREE.InstancedMesh(boxGeo, mat, dim*dim);
+
+  const spacing = 1.05;
+  const span = dim*spacing;
+  const maxHeight = Math.max(6, 22 - n*1.6); // taller bars for smaller dim, kept sane for large dim
+
+  const preset = PRESETS[currentPreset];
+  let k = 0;
+  for(let i=0;i<dim;i++){
+    for(let j=0;j<dim;j++){
+      const [idx, sign] = mulBasis(dim, i, j);
+      let h;
+      if(currentHeightMode==='idx') h = 0.15 + (idx/dim)*maxHeight;
+      else if(currentHeightMode==='sign') h = sign>0 ? maxHeight*0.55 : maxHeight*0.18;
+      else { const d = Math.abs(i-j)/dim; h = 0.15 + d*maxHeight; }
+
+      dummy.position.set((j-dim/2)*spacing, h/2, (i-dim/2)*spacing);
+      dummy.scale.set(0.88, h, 0.88);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(k, dummy.matrix);
+
+      const t = idx/dim;
+      const hueDeg = preset.hueStart + (preset.hueEnd-preset.hueStart)*t;
+      const light = sign<0 ? preset.lightNeg : preset.lightPos;
+      color.setHSL((hueDeg%360)/360, preset.sat, light);
+      mesh.setColorAt(k, color);
+      k++;
+    }
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if(mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  rig.add(mesh);
+  instancedMesh = mesh;
+
+  document.getElementById('stats').textContent = `${dim}×${dim} = ${(dim*dim).toLocaleString()} セル`;
+
+  // frame camera to fit
+  const dist = Math.max(18, span*0.85);
+  camera.position.set(dist*0.6, dist*0.55, dist*0.6);
+  camera.lookAt(0, maxHeight*0.2, 0);
+}
+buildTable(currentN);
+
+/* ---- manual orbit (drag to rotate, wheel to zoom) — no external deps ---- */
+let isDragging = false, lastX = 0, lastY = 0;
+let theta = Math.PI*0.25, phi = 1.0, radius = 26;
+function updateCameraFromSpherical(){
+  camera.position.x = radius * Math.sin(phi) * Math.sin(theta);
+  camera.position.y = radius * Math.cos(phi);
+  camera.position.z = radius * Math.sin(phi) * Math.cos(theta);
+  camera.lookAt(0, radius*0.12, 0);
+}
+function recomputeRadiusFromCamera(){
+  radius = camera.position.length();
+}
+container.addEventListener('pointerdown', (e)=>{ isDragging=true; lastX=e.clientX; lastY=e.clientY; container.classList.add('dragging'); });
+window.addEventListener('pointerup', ()=>{ isDragging=false; container.classList.remove('dragging'); });
+window.addEventListener('pointermove', (e)=>{
+  if(!isDragging) return;
+  const dx = e.clientX-lastX, dy = e.clientY-lastY;
+  lastX=e.clientX; lastY=e.clientY;
+  theta -= dx*0.006;
+  phi = Math.max(0.15, Math.min(Math.PI/2-0.02, phi - dy*0.006));
+  updateCameraFromSpherical();
+});
+container.addEventListener('wheel', (e)=>{
+  e.preventDefault();
+  radius = Math.max(6, Math.min(120, radius + e.deltaY*0.03));
+  updateCameraFromSpherical();
+}, { passive:false });
+recomputeRadiusFromCamera();
+updateCameraFromSpherical();
+
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ---- UI wiring ---- */
+document.getElementById('nSlider').addEventListener('input', (e)=>{
+  buildTable(parseInt(e.target.value));
+  recomputeRadiusFromCamera();
+});
+document.getElementById('heightMode').addEventListener('change', (e)=>{
+  currentHeightMode = e.target.value;
+  buildTable(currentN);
+  recomputeRadiusFromCamera();
+});
+document.querySelectorAll('.pill').forEach(p=>{
+  p.addEventListener('click', ()=>{
+    document.querySelectorAll('.pill').forEach(x=>x.classList.remove('active'));
+    p.classList.add('active');
+    currentPreset = p.dataset.preset;
+    buildTable(currentN);
+  });
+});
+let autoRotate = true;
+document.getElementById('autoRotate').addEventListener('change', (e)=>{ autoRotate = e.target.checked; });
+
+/* ---- render loop ---- */
+function animate(){
+  requestAnimationFrame(animate);
+  if(autoRotate && !isDragging){
+    theta += 0.0022;
+    updateCameraFromSpherical();
+  }
+  renderer.render(scene, camera);
+}
+animate();
+
+// Safety net: never let a third-party script error surface disruptively.
+window.addEventListener('error', (e)=>{ console.warn('caught:', e.message||e); e.preventDefault(); }, true);
+</script>
+</body>
+</html>
